@@ -5,15 +5,7 @@ import joblib
 import tensorflow as tf
 from scipy.signal import butter, lfilter
 from pydub import AudioSegment
-import logging
-from flask import Flask, request, jsonify
-
-# Initialize Flask app
-app = Flask(__name__)
-
-# Enable Flask logging
-logging.basicConfig(level=logging.DEBUG)
-app.logger.info("Flask app started")
+import gradio as gr
 
 # Load TFLite model
 interpreter = tf.lite.Interpreter(model_path="best_urdu_deep_model.tflite")
@@ -47,7 +39,6 @@ def augment_audio(y: np.ndarray, sr: int) -> list:
     aug.append(lfilter(b, a, y))
     return aug
 
-# Feature extraction
 def extract_features(y: np.ndarray, sr: int) -> np.ndarray:
     mfccs = np.mean(librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13).T, axis=0)
     chroma = np.mean(librosa.feature.chroma_stft(y=y, sr=sr).T, axis=0)
@@ -56,66 +47,45 @@ def extract_features(y: np.ndarray, sr: int) -> np.ndarray:
     rmse = np.mean(librosa.feature.rms(y=y).T, axis=0)
     return np.hstack([mfccs, chroma, contrast, zcr, rmse])
 
-@app.route('/predict', methods=['POST'])
-def predict():
-    if 'audio' not in request.files:
-        return jsonify({'error': 'No audio file provided'}), 400
-
-    audio_file = request.files['audio']
-
-    if audio_file.filename == '':
-        return jsonify({'error': 'Empty filename'}), 400
-
+def predict(audio_path: str) -> str:
+    if audio_path is None:
+        return "Please upload an audio file."
     try:
-        # Save uploaded audio
-        temp_input_path = "temp_input"
-        os.makedirs(temp_input_path, exist_ok=True)
-        raw_audio_path = os.path.join(temp_input_path, audio_file.filename)
-        audio_file.save(raw_audio_path)
+        wav_path = "converted.wav"
+        convert_to_wav(audio_path, wav_path)
 
-        # Convert to wav
-        wav_path = os.path.join(temp_input_path, "converted.wav")
-        convert_to_wav(raw_audio_path, wav_path)
-        
-        # Load and preprocess audio
         y, sr = librosa.load(wav_path, sr=16000)
         y = remove_noise(y, sr)
 
-        # Create augmented versions
         augmented_audios = augment_audio(y, sr)
-        all_features = []
-
-        # Extract features from original + augmented audios
-        for aug_y in [y] + augmented_audios:
-            features = extract_features(aug_y, sr)
-            all_features.append(features)
-
-        # Average features
+        all_features = [extract_features(aug_y, sr) for aug_y in [y] + augmented_audios]
         avg_features = np.mean(all_features, axis=0)
 
-        # Scale features
         scaled_features = scaler.transform([avg_features]).astype(np.float32)
 
-        # Predict
         interpreter.set_tensor(input_details[0]['index'], scaled_features)
         interpreter.invoke()
         output_data = interpreter.get_tensor(output_details[0]['index'])
 
-        # Decode prediction
         predicted_label = label_encoder.inverse_transform([np.argmax(output_data)])[0]
 
-        return jsonify({'result': predicted_label})
+        if os.path.exists(wav_path):
+            os.remove(wav_path)
+
+        return f"Prediction: {predicted_label}"
 
     except Exception as e:
-        app.logger.error(f"Error during prediction: {str(e)}")
-        return jsonify({'error': str(e)}), 500
+        return f"Error: {str(e)}"
 
-    finally:
-        # Clean up temporary files
-        if os.path.exists(temp_input_path):
-            for f in os.listdir(temp_input_path):
-                os.remove(os.path.join(temp_input_path, f))
-            os.rmdir(temp_input_path)
+demo = gr.Interface(
+    fn=predict,
+    inputs=gr.Audio(type="filepath", label="Upload Urdu Audio File"),
+    outputs=gr.Text(label="Result"),
+    title="TrueTone — Urdu Audio Forgery Detection",
+    description="Upload an Urdu audio file to detect whether it is Original, AI Generated, or Combined. Built using a TFLite deep learning model trained on 1,530+ Urdu audio samples with 7-type data augmentation.",
+    examples=[],
+    theme="soft"
+)
 
-if __name__ == '__main__':
-    app.run(debug=True)
+if __name__ == "__main__":
+    demo.launch()
