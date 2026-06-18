@@ -1,11 +1,17 @@
 import os
+import tempfile
 import numpy as np
 import librosa
 import joblib
+import pandas as pd
 import tensorflow as tf
 from scipy.signal import butter, lfilter
 from pydub import AudioSegment
 import gradio as gr
+import warnings
+
+# Suppress sklearn warnings about feature names
+warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
 
 # Load TFLite model
 interpreter = tf.lite.Interpreter(model_path="best_urdu_deep_model.tflite")
@@ -17,7 +23,16 @@ output_details = interpreter.get_output_details()
 scaler = joblib.load("scaler.pkl")
 label_encoder = joblib.load("label_encoder.pkl")
 
+# Recreate exact feature names used during training to prevent StandardScaler misalignment
+FEATURE_NAMES = (
+    ['MFCC_{}'.format(i+1) for i in range(13)] + \
+    ['Chroma_{}'.format(i+1) for i in range(12)] + \
+    ['Spectral_Contrast_{}'.format(i+1) for i in range(7)] + \
+    ['ZCR'] + ['RMSE']
+)
+
 def convert_to_wav(in_path: str, out_path: str) -> str:
+    # Let pydub figure out the format automatically to support all file types
     audio = AudioSegment.from_file(in_path)
     audio = audio.set_frame_rate(16000).set_channels(1)
     audio.export(out_path, format="wav")
@@ -50,32 +65,44 @@ def extract_features(y: np.ndarray, sr: int) -> np.ndarray:
 def predict(audio_path: str) -> str:
     if audio_path is None:
         return "Please upload an audio file."
-    try:
-        wav_path = "converted.wav"
-        convert_to_wav(audio_path, wav_path)
+    
+    # Use named temporary file to handle concurrent users safely
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_wav:
+        wav_path = tmp_wav.name
 
+    try:
+        # Convert any audio standard/extension securely
+        convert_to_wav(audio_path, wav_path)
+        
+        # Load and process
         y, sr = librosa.load(wav_path, sr=16000)
         y = remove_noise(y, sr)
-
+        
+        # Features mapping
         augmented_audios = augment_audio(y, sr)
         all_features = [extract_features(aug_y, sr) for aug_y in [y] + augmented_audios]
         avg_features = np.mean(all_features, axis=0)
-
-        scaled_features = scaler.transform([avg_features]).astype(np.float32)
-
+        
+        # FIX: Format as a pandas DataFrame matching Kaggle training structure precisely
+        feats_df = pd.DataFrame(avg_features.reshape(1, -1), columns=FEATURE_NAMES)
+        scaled_features = scaler.transform(feats_df).astype(np.float32)
+        
+        # Inference
         interpreter.set_tensor(input_details[0]['index'], scaled_features)
         interpreter.invoke()
         output_data = interpreter.get_tensor(output_details[0]['index'])
-
+        
+        # Translate predictions back to string labels
         predicted_label = label_encoder.inverse_transform([np.argmax(output_data)])[0]
-
-        if os.path.exists(wav_path):
-            os.remove(wav_path)
-
         return f"Prediction: {predicted_label}"
-
+        
     except Exception as e:
         return f"Error: {str(e)}"
+        
+    finally:
+        # Clean up the temporary file immediately
+        if os.path.exists(wav_path):
+            os.remove(wav_path)
 
 demo = gr.Interface(
     fn=predict,
